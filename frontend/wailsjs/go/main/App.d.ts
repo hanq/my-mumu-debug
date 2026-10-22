@@ -11,6 +11,8 @@ export function ConnectDevice(arg1:string):Promise<void>;
 
 export function DetectEnvironment():Promise<mumu.InstallInfo>;
 
+export function DisconnectDevice(arg1:string):Promise<void>;
+
 export function EnsureRoot(arg1:string):Promise<void>;
 
 export function GetForegroundApp(arg1:string):Promise<Record<string, string>>;

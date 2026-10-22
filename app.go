@@ -90,6 +90,18 @@ func (a *App) EnsureRoot(serial string) error {
 	return nil
 }
 
+// DisconnectDevice 断开 adb 连接。
+func (a *App) DisconnectDevice(serial string) error {
+	if a.client == nil {
+		return fmt.Errorf("请先执行环境检测")
+	}
+	if err := a.client.Disconnect(a.ctx, serial); err != nil {
+		return err
+	}
+	a.log("adb 已断开 %s", serial)
+	return nil
+}
+
 // GetForegroundApp 前台应用。
 func (a *App) GetForegroundApp(serial string) (map[string]string, error) {
 	if a.client == nil {

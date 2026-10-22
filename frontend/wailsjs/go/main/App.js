@@ -18,6 +18,10 @@ export function DetectEnvironment() {
   return window['go']['main']['App']['DetectEnvironment']();
 }
 
+export function DisconnectDevice(arg1) {
+  return window['go']['main']['App']['DisconnectDevice'](arg1);
+}
+
 export function EnsureRoot(arg1) {
   return window['go']['main']['App']['EnsureRoot'](arg1);
 }

@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import {
-  DetectEnvironment, ListInstances, ConnectDevice, EnsureRoot,
+  DetectEnvironment, ListInstances, ConnectDevice, DisconnectDevice, EnsureRoot,
   GetForegroundApp, InstallCertificate, StartCapture, StopCapture,
   CaptureRunning, GetProcessConnections,
 } from '../wailsjs/go/main/App'
-import { EventsOn } from '../wailsjs/runtime/runtime'
+import { EventsOn, WindowMinimise, WindowToggleMaximise, Quit } from '../wailsjs/runtime/runtime'
 import type { EmuInstance, FlowEvent, ProcConnection } from './types'
 
 // ---------- 状态 ----------
@@ -26,10 +26,11 @@ const noiseFilter = ref(true)
 const detailTab = ref<'resp' | 'req' | 'headers'>('resp')
 const connDiag = ref<ProcConnection[]>([])
 const busy = ref('')
+const tab = ref<'flows' | 'logs'>('flows')
 
 function log(msg: string) {
   stepLogs.value.push(msg)
-  if (stepLogs.value.length > 200) stepLogs.value.shift()
+  if (stepLogs.value.length > 500) stepLogs.value.shift()
 }
 
 async function guard(name: string, fn: () => Promise<any>) {
@@ -37,21 +38,42 @@ async function guard(name: string, fn: () => Promise<any>) {
   try { return await fn() } finally { busy.value = '' }
 }
 
+// ---------- 实例状态派生 ----------
+const runningInstances = computed(() => instances.value.filter(i => i.running))
+const selInst = computed(() => instances.value.find(i => i.serial === serial.value))
+const hasRunning = computed(() => runningInstances.value.length > 0)
+const selRunning = computed(() => !!selInst.value?.running)
+
 // ---------- 步骤动作 ----------
 async function detect() {
   await guard('detect', async () => {
     const info: any = await DetectEnvironment()
     mumuInstalled.value = info.installed
     mumuDir.value = info.dir || ''
-    if (!info.installed) { log('未检测到 MuMu 安装'); return }
+    if (!info.installed) { log('未检测到 MuMu 安装'); instances.value = []; return }
     instances.value = (await ListInstances()) || []
-    log(`检测完成: ${instances.value.length} 个实例`)
-    const running = instances.value.find(i => i.running)
-    if (running) serial.value = running.serial
+    const run = runningInstances.value
+    if (!run.length) {
+      serial.value = ''
+      log('未检测到运行中的模拟器实例, 请先打开 MuMu')
+    } else {
+      if (!selRunning.value) serial.value = run[0].serial
+      log(`检测完成: ${instances.value.length} 个实例, ${run.length} 个运行中`)
+    }
   })
 }
 
-async function connect() {
+async function toggleConnect() {
+  if (connected.value) {
+    await guard('disconnect', async () => {
+      await DisconnectDevice(serial.value)
+      connected.value = false
+      rooted.value = false
+      connDiag.value = []
+      log(`adb 已断开 ${serial.value}`)
+    })
+    return
+  }
   await guard('connect', async () => {
     await ConnectDevice(serial.value)
     connected.value = true
@@ -87,6 +109,7 @@ async function installCert() {
 async function startCapture() {
   await guard('start', async () => {
     flows.value = []
+    tab.value = 'flows'
     await StartCapture(serial.value, targetPkg.value, 8888, false)
     capturing.value = true
     log('抓包已开启')
@@ -147,53 +170,72 @@ function showDetail(f: FlowEvent) {
 
 <template>
   <div class="app">
-    <!-- 顶栏 -->
-    <header class="topbar">
-      <svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 18v3M7 9l3 3-3 3M12 15h5"/>
-      </svg>
-      <h1>MuMu 抓包调试工具</h1>
-      <div class="badges">
-        <span class="badge" :class="mumuInstalled ? 'on' : 'off'">MuMu</span>
-        <span class="badge" :class="connected ? 'on' : 'off'">ADB</span>
-        <span class="badge" :class="rooted ? 'on' : 'off'">Root</span>
-        <span class="badge" :class="capturing ? 'on' : 'off'">Capture</span>
+    <!-- 自定义标题栏(可拖拽) -->
+    <header class="titlebar">
+      <div class="tb-left">
+        <svg class="tb-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="4" width="20" height="14" rx="1"/><path d="M8 21h8M12 18v3M7 9l3 3-3 3M12 15h5"/>
+        </svg>
+        <span class="tb-title">MUMU // CAPTURE</span>
+        <span class="tb-sub">模拟器 HTTP 抓包终端</span>
+      </div>
+      <div class="tb-btns">
+        <button class="tb-btn" title="最小化" @click="WindowMinimise()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
+        </button>
+        <button class="tb-btn" title="最大化/还原" @click="WindowToggleMaximise()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="5" width="14" height="14"/></svg>
+        </button>
+        <button class="tb-btn tb-close" title="退出" @click="Quit()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
       </div>
     </header>
 
     <div class="main">
       <!-- 左列: 步骤操作 -->
       <aside class="panel steps">
-        <h2>步骤</h2>
+        <div class="panel-tag">PROC // 操作序列</div>
 
         <div class="step">
-          <div class="step-head">1. 环境检测</div>
+          <div class="step-head"><i>01</i>环境检测</div>
           <button :disabled="busy !== ''" @click="detect">
             {{ busy === 'detect' ? '检测中...' : '检测 MuMu / 实例' }}
           </button>
           <div v-if="mumuDir" class="hint">{{ mumuDir }}</div>
-          <select v-if="instances.length" v-model="serial" class="input">
-            <option v-for="i in instances" :key="i.serial" :value="i.serial">
-              {{ i.name }} #{{ i.index }} [{{ i.serial }}] {{ i.running ? '●' : '○' }}
-            </option>
-          </select>
+
+          <template v-if="instances.length">
+            <select v-model="serial" class="input">
+              <option v-for="i in instances" :key="i.serial" :value="i.serial" :disabled="!i.running">
+                {{ i.name }} #{{ i.index }} [{{ i.serial }}] {{ i.running ? 'ONLINE' : 'OFFLINE' }}
+              </option>
+            </select>
+            <div v-if="!hasRunning" class="warn-box">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3l10 18H2L12 3z"/><path d="M12 10v5M12 18h.01"/>
+              </svg>
+              模拟器未开机，请先打开 MuMu 模拟器
+            </div>
+          </template>
         </div>
 
         <div class="step">
-          <div class="step-head">2. 连接与 Root</div>
+          <div class="step-head"><i>02</i>连接与 Root</div>
           <div class="row">
-            <button :disabled="!serial || busy !== ''" @click="connect">连接 ADB</button>
+            <button :disabled="!serial || !selRunning || busy !== ''" @click="toggleConnect">
+              {{ connected ? '断开 ADB' : '连接 ADB' }}
+            </button>
             <button :disabled="!connected || rooted || busy !== ''" @click="ensureRoot">获取 Root</button>
           </div>
         </div>
 
         <div class="step">
-          <div class="step-head">3. 目标应用</div>
+          <div class="step-head"><i>03</i>目标应用</div>
           <div class="row">
             <button :disabled="!rooted || busy !== ''" @click="detectForeground">取前台应用</button>
             <button :disabled="!rooted || !targetPkg || busy !== ''" @click="diagConnections">连接诊断</button>
           </div>
-          <input v-model="targetPkg" class="input" placeholder="包名, 如 com.gtex.timp" />
+          <input v-model="targetPkg" class="input" placeholder="包名, 如 com.gtex.timp" spellcheck="false" />
           <div v-if="foreground" class="hint">{{ foreground }}</div>
           <ul v-if="connDiag.length" class="conn-list">
             <li v-for="(c, i) in connDiag" :key="i">
@@ -203,7 +245,7 @@ function showDetail(f: FlowEvent) {
         </div>
 
         <div class="step">
-          <div class="step-head">4. 抓包</div>
+          <div class="step-head"><i>04</i>抓包</div>
           <div class="row">
             <button class="primary" :disabled="!rooted || !targetPkg || capturing || busy !== ''" @click="startCapture">
               开启抓包
@@ -211,56 +253,80 @@ function showDetail(f: FlowEvent) {
             <button class="danger" :disabled="!capturing || busy !== ''" @click="stopCapture">停止</button>
           </div>
           <button class="ghost" :disabled="!rooted || busy !== ''" @click="installCert">仅重装证书(幂等)</button>
-          <p class="note">抓取 HTTP 请求/响应; IM 私有协议长连接不走代理, 不在抓包范围。</p>
-        </div>
-
-        <h2>日志</h2>
-        <div class="stepl_logs">
-          <div v-for="(l, i) in stepLogs" :key="i" class="logline">{{ l }}</div>
+          <p class="note">抓取 HTTP 请求/响应。IM 私有协议长连接不走代理, 不在抓包范围。</p>
         </div>
       </aside>
 
-      <!-- 右列: 请求列表 + 详情 -->
-      <section class="panel flows">
-        <div class="flows-toolbar">
-          <h2>HTTP 请求 ({{ visibleFlows.length }})</h2>
-          <input v-model="filterText" class="input" placeholder="URL 过滤..." />
-          <label class="chk"><input type="checkbox" v-model="noiseFilter" /> 屏蔽统计噪声</label>
-        </div>
-        <div class="flow-table">
-          <table>
-            <thead>
-              <tr><th>时间</th><th>方法</th><th>URL</th><th>状态</th><th>耗时</th></tr>
-            </thead>
-            <tbody>
-              <tr v-if="!visibleFlows.length">
-                <td colspan="5" class="empty">暂无数据 — 完成左侧步骤并在模拟器中操作应用</td>
-              </tr>
-              <tr v-for="(f, i) in visibleFlows" :key="visibleFlows.length - i"
-                  :class="{ sel: selectedFlow === f }" @click="showDetail(f)">
-                <td class="mono">{{ f.ts }}</td>
-                <td><span class="method">{{ f.type === 'tls_fail' ? 'TLS!' : f.method }}</span></td>
-                <td class="url mono">{{ f.type === 'tls_fail' ? `TLS握手失败: ${f.sni}` : f.url }}</td>
-                <td><span class="status" :class="statusClass(f.status)">{{ f.status || '-' }}</span></td>
-                <td class="mono">{{ f.duration_ms ? f.duration_ms + 'ms' : '' }}</td>
-              </tr>
-            </tbody>
-          </table>
+      <!-- 右列: TAB(请求 / 日志) -->
+      <section class="panel work">
+        <div class="work-tabs">
+          <button :class="{ act: tab === 'flows' }" @click="tab = 'flows'">
+            HTTP 请求 <em>{{ visibleFlows.length }}</em>
+          </button>
+          <button :class="{ act: tab === 'logs' }" @click="tab = 'logs'">
+            运行日志 <em>{{ stepLogs.length }}</em>
+          </button>
+          <div class="tab-status" :class="capturing ? 'live' : ''">
+            {{ capturing ? '● CAPTURE ACTIVE' : '○ IDLE' }}
+          </div>
         </div>
 
-        <!-- 详情 -->
-        <div v-if="selectedFlow" class="detail">
-          <div class="detail-tabs">
-            <button :class="{ act: detailTab === 'resp' }" @click="detailTab = 'resp'">响应体</button>
-            <button :class="{ act: detailTab === 'req' }" @click="detailTab = 'req'">请求体</button>
-            <button :class="{ act: detailTab === 'headers' }" @click="detailTab = 'headers'">请求头</button>
-            <button class="close" @click="selectedFlow = null">关闭</button>
+        <!-- TAB: 请求 -->
+        <div v-show="tab === 'flows'" class="tab-pane tab-flows">
+          <div class="flows-toolbar">
+            <input v-model="filterText" class="input" placeholder="URL 过滤..." spellcheck="false" />
+            <label class="chk"><input type="checkbox" v-model="noiseFilter" /> 屏蔽统计噪声</label>
           </div>
-          <pre v-if="detailTab === 'resp'" class="body">{{ selectedFlow.resp_body || '(空)' }}{{ selectedFlow.truncated ? '\n...[已截断]' : '' }}</pre>
-          <pre v-else-if="detailTab === 'req'" class="body">{{ selectedFlow.req_body || '(空)' }}</pre>
-          <pre v-else class="body">{{ JSON.stringify(selectedFlow.req_headers, null, 2) }}</pre>
+          <div class="flow-table">
+            <table>
+              <thead>
+                <tr><th>时间</th><th>方法</th><th>URL</th><th>状态</th><th>耗时</th></tr>
+              </thead>
+              <tbody>
+                <tr v-if="!visibleFlows.length">
+                  <td colspan="5" class="empty">NO DATA — 完成左侧操作序列并在模拟器中操作应用</td>
+                </tr>
+                <tr v-for="(f, i) in visibleFlows" :key="visibleFlows.length - i"
+                    :class="{ sel: selectedFlow === f }" @click="showDetail(f)">
+                  <td class="mono">{{ f.ts }}</td>
+                  <td><span class="method">{{ f.type === 'tls_fail' ? 'TLS!' : f.method }}</span></td>
+                  <td class="url mono">{{ f.type === 'tls_fail' ? `TLS握手失败: ${f.sni}` : f.url }}</td>
+                  <td><span class="status" :class="statusClass(f.status)">{{ f.status || '-' }}</span></td>
+                  <td class="mono">{{ f.duration_ms ? f.duration_ms + 'ms' : '' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div v-if="selectedFlow" class="detail">
+            <div class="detail-tabs">
+              <button :class="{ act: detailTab === 'resp' }" @click="detailTab = 'resp'">响应体</button>
+              <button :class="{ act: detailTab === 'req' }" @click="detailTab = 'req'">请求体</button>
+              <button :class="{ act: detailTab === 'headers' }" @click="detailTab = 'headers'">请求头</button>
+              <button class="close" @click="selectedFlow = null">关闭</button>
+            </div>
+            <pre v-if="detailTab === 'resp'" class="body">{{ selectedFlow.resp_body || '(空)' }}{{ selectedFlow.truncated ? '\n...[已截断]' : '' }}</pre>
+            <pre v-else-if="detailTab === 'req'" class="body">{{ selectedFlow.req_body || '(空)' }}</pre>
+            <pre v-else class="body">{{ JSON.stringify(selectedFlow.req_headers, null, 2) }}</pre>
+          </div>
+        </div>
+
+        <!-- TAB: 日志 -->
+        <div v-show="tab === 'logs'" class="tab-pane tab-logs">
+          <div class="logs-full">
+            <div v-for="(l, i) in stepLogs" :key="i" class="logline">{{ l }}</div>
+            <div v-if="!stepLogs.length" class="empty">NO LOG</div>
+          </div>
         </div>
       </section>
     </div>
+
+    <!-- 底部状态条 -->
+    <footer class="statusbar">
+      <span>SERIAL: <b>{{ serial || '---' }}</b></span>
+      <span>PORT: <b>8888</b></span>
+      <span>PKG: <b>{{ targetPkg || '---' }}</b></span>
+      <span class="right" :class="capturing ? 'live' : ''">{{ capturing ? 'CAPTURE ACTIVE' : 'STANDBY' }}</span>
+    </footer>
   </div>
 </template>

@@ -58,6 +58,15 @@ func (c *Client) Connect(ctx context.Context, serial string) error {
 	return fmt.Errorf("adb connect %s: %s", serial, out)
 }
 
+// Disconnect 断开指定设备的 adb 连接。
+func (c *Client) Disconnect(ctx context.Context, serial string) error {
+	out, err := c.run(ctx, tConnect, "disconnect", serial)
+	if err != nil {
+		return fmt.Errorf("adb disconnect %s: %w (%s)", serial, err, out)
+	}
+	return nil
+}
+
 // State 设备状态(device/offline/...)
 func (c *Client) State(ctx context.Context, serial string) (string, error) {
 	out, err := c.runWithSerial(ctx, serial, tShort, "get-state")

@@ -49,6 +49,8 @@ docs/research/          # 实机调研文档（改协议/流程前必读对应�
 - Go：导出函数带注释；错误用 `fmt.Errorf("...: %w", err)` 包裹；所有外部命令调用必须带超时 `exec.CommandContext`
 - 前端组件 **PascalCase.vue**；composable 用 `useXxx.ts`
 - **UI 禁止 emoji 作图标**：统一内联线性 SVG（`viewBox="0 0 24 24"`、`stroke="currentColor"`、`stroke-width="2"`、圆头端点）
+- **窗口为无边框(Frameless)**：自定义标题栏用 `--wails-draggable: drag` 标记拖拽区，窗控按钮区域必须 `no-drag`；双击标题栏切换最大化
+- **全局禁用默认焦点 outline**（WebView2 点击会出现黑框闪烁）：`button:focus { outline:none }`，键盘焦点用 `:focus-visible` 自定义样式
 - 提示性文案用文字；日志/调试输出可用 emoji
 - 新增外部命令调用时，把命令与参数记入 `docs/research/` 对应篇
 
