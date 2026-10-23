@@ -5,11 +5,12 @@ package adb
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"my-mumu-debug/internal/execx"
 )
 
 // Client 一个绑定 adb 可执行文件路径的客户端(线程安全, 无状态)。
@@ -35,7 +36,7 @@ func (c *Client) bin() string {
 func (c *Client) run(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, c.bin(), args...).CombinedOutput()
+	out, err := execx.Command(ctx, c.bin(), args...).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
 

@@ -25,6 +25,8 @@ export function ListInstances():Promise<Array<mumu.EmuInstance>>;
 
 export function ListThirdPartyPackages(arg1:string):Promise<Array<string>>;
 
+export function OpenAdbShell(arg1:string):Promise<void>;
+
 export function StartCapture(arg1:string,arg2:string,arg3:number,arg4:boolean):Promise<void>;
 
 export function StopCapture():Promise<void>;

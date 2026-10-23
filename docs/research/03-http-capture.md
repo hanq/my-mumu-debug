@@ -64,7 +64,7 @@ addon 要点（继承实测脚本）：
 
 ## 5. 目标 APP 的实测行为（ limitations ）
 
-- 业务 API（gtex-uat.grectronics.cn）走系统代理 → **可抓** ✅
+- 业务 API 走系统代理 → **可抓** ✅
 - IM 长连接直连腾讯 `118.89.191.1:443`（私有协议 over 裸 TCP）→ **不走代理，抓不到** ❌
   - 识别方法：`adb shell netstat -tunp | grep <pid>` 看是否出现 `10.0.2.2:8888` 连接
 - DCloud/uni-app 的 JS console 日志：logcat tag `console`（与抓包互补）

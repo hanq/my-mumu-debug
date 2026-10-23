@@ -16,6 +16,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"my-mumu-debug/internal/execx"
 )
 
 //go:embed mitm_addon.py
@@ -49,8 +51,21 @@ type FlowEvent struct {
 	Error       string            `json:"error"`
 }
 
-// FindMitmdump 按优先级查找 mitmdump: PATH → pip 官方安装器默认目录。
+// FindMitmdump 按优先级查找 mitmdump:
+//  1. 捆绑独立版(打包布局: exe 同级 mitmdump\mitmdump.exe, 随包分发, 无需 Python)
+//  2. 开发态: 项目 third_party\mitmdump\mitmdump.exe(相对工作目录)
+//  3. PATH
+//  4. pip 官方安装器默认目录(兼容旧装机)
 func FindMitmdump() string {
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), "mitmdump", "mitmdump.exe")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	if _, err := os.Stat(filepath.Join("third_party", "mitmdump", "mitmdump.exe")); err == nil {
+		return filepath.Join("third_party", "mitmdump", "mitmdump.exe")
+	}
 	if p, err := exec.LookPath("mitmdump"); err == nil {
 		return p
 	}
@@ -88,7 +103,7 @@ func GenerateCA(ctx context.Context, mitmdump string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, mitmdump, "--listen-host", "127.0.0.1", "--listen-port", fmt.Sprint(port))
+	cmd := execx.Command(ctx, mitmdump, "--listen-host", "127.0.0.1", "--listen-port", fmt.Sprint(port))
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动 mitmdump 生成 CA: %w", err)
 	}
@@ -117,7 +132,7 @@ func CAPathOf(_ string) string {
 
 // PortListening 检查本地端口是否有 LISTENING。
 func PortListening(port int) (bool, int) {
-	out, err := exec.Command("netstat", "-ano").Output()
+	out, err := execx.Command(context.Background(), "netstat", "-ano").Output()
 	if err != nil {
 		return false, 0
 	}
@@ -137,7 +152,7 @@ func killByPort(port int) error {
 	if !ok {
 		return nil
 	}
-	return exec.Command("taskkill", "/F", "/PID", fmt.Sprint(pid)).Run()
+	return execx.Command(context.Background(), "taskkill", "/F", "/PID", fmt.Sprint(pid)).Run()
 }
 
 // Session 一次抓包会话。
@@ -164,8 +179,13 @@ func Start(ctx context.Context, opts Options,
 	if opts.Port == 0 {
 		opts.Port = 8888
 	}
-	if ok, pid := PortListening(opts.Port); ok {
-		return nil, fmt.Errorf("端口 %d 已被占用 (PID %d), 请换端口或先停止", opts.Port, pid)
+	if ok, _ := PortListening(opts.Port); ok {
+		// 可能是上次会话异常退出残留的 mitmdump(pip 版为 wrapper+python 双进程), 先自动清理一次
+		_ = killByPort(opts.Port)
+		time.Sleep(500 * time.Millisecond)
+		if ok2, pid2 := PortListening(opts.Port); ok2 {
+			return nil, fmt.Errorf("端口 %d 已被占用 (PID %d), 自动清理失败, 请换端口或手动结束进程", opts.Port, pid2)
+		}
 	}
 	addonPath, err := writeAddon()
 	if err != nil {
@@ -181,8 +201,10 @@ func Start(ctx context.Context, opts Options,
 		args = append(args, "-w", opts.FlowPath)
 	}
 	c, cancel := context.WithCancel(ctx)
-	cmd := exec.CommandContext(c, FindMitmdump(), args...)
-	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
+	cmd := execx.Command(c, FindMitmdump(), args...)
+	// 强制 Python 子进程用 UTF-8 标准输出: Windows 管道模式默认跟随系统 ANSI 代码页(cp936/GBK),
+	// 否则中文以 GBK 字节进入 Go, JSON 序列化时非法 UTF-8 变 U+FFFD 乱码(如 "�ɹ𤉙")。
+	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1", "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1")
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -3,7 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import {
   DetectEnvironment, ListInstances, ConnectDevice, DisconnectDevice, EnsureRoot,
   GetForegroundApp, InstallCertificate, StartCapture, StopCapture,
-  CaptureRunning, GetProcessConnections,
+  CaptureRunning, GetProcessConnections, OpenAdbShell,
 } from '../wailsjs/go/main/App'
 import { EventsOn, WindowMinimise, WindowToggleMaximise, Quit } from '../wailsjs/runtime/runtime'
 import type { EmuInstance, FlowEvent, ProcConnection } from './types'
@@ -11,6 +11,7 @@ import type { EmuInstance, FlowEvent, ProcConnection } from './types'
 // ---------- 状态 ----------
 const mumuInstalled = ref(false)
 const mumuDir = ref('')
+const detected = ref(false)
 const instances = ref<EmuInstance[]>([])
 const serial = ref('')
 const connected = ref(false)
@@ -26,7 +27,7 @@ const noiseFilter = ref(true)
 const detailTab = ref<'resp' | 'req' | 'headers'>('resp')
 const connDiag = ref<ProcConnection[]>([])
 const busy = ref('')
-const tab = ref<'flows' | 'logs'>('flows')
+const tab = ref<'flows' | 'logs'>('logs')
 
 function log(msg: string) {
   stepLogs.value.push(msg)
@@ -35,7 +36,14 @@ function log(msg: string) {
 
 async function guard(name: string, fn: () => Promise<any>) {
   busy.value = name
-  try { return await fn() } finally { busy.value = '' }
+  try {
+    return await fn()
+  } catch (e: any) {
+    log(`${name} 失败: ${e}`)
+    tab.value = 'logs' // 失败时切到运行日志, 让用户看到原因
+  } finally {
+    busy.value = ''
+  }
 }
 
 // ---------- 实例状态派生 ----------
@@ -43,11 +51,19 @@ const runningInstances = computed(() => instances.value.filter(i => i.running))
 const selInst = computed(() => instances.value.find(i => i.serial === serial.value))
 const hasRunning = computed(() => runningInstances.value.length > 0)
 const selRunning = computed(() => !!selInst.value?.running)
+// 无运行中实例时的提示文案(空串 = 不显示提示框)
+const instHint = computed(() => {
+  if (!detected.value) return ''
+  if (instances.value.length && !hasRunning.value) return '模拟器未开机，请先打开 MuMu 模拟器'
+  if (mumuInstalled.value) return '未检测到 MuMu 实例'
+  return '未检测到 MuMu 模拟器安装'
+})
 
 // ---------- 步骤动作 ----------
 async function detect() {
   await guard('detect', async () => {
     const info: any = await DetectEnvironment()
+    detected.value = true
     mumuInstalled.value = info.installed
     mumuDir.value = info.dir || ''
     if (!info.installed) { log('未检测到 MuMu 安装'); instances.value = []; return }
@@ -86,6 +102,13 @@ async function ensureRoot() {
     await EnsureRoot(serial.value)
     rooted.value = true
     log('root 权限 OK')
+  })
+}
+
+async function openShell() {
+  await guard('shell', async () => {
+    await OpenAdbShell(serial.value)
+    log(`已打开 ADB Shell 窗口 (${serial.value}), 窗口内输入 exit 可退出`)
   })
 }
 
@@ -204,19 +227,18 @@ function showDetail(f: FlowEvent) {
           </button>
           <div v-if="mumuDir" class="hint">{{ mumuDir }}</div>
 
-          <template v-if="instances.length">
-            <select v-model="serial" class="input">
-              <option v-for="i in instances" :key="i.serial" :value="i.serial" :disabled="!i.running">
-                {{ i.name }} #{{ i.index }} [{{ i.serial }}] {{ i.running ? 'ONLINE' : 'OFFLINE' }}
-              </option>
-            </select>
-            <div v-if="!hasRunning" class="warn-box">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 3l10 18H2L12 3z"/><path d="M12 10v5M12 18h.01"/>
-              </svg>
-              模拟器未开机，请先打开 MuMu 模拟器
-            </div>
-          </template>
+          <!-- 仅存在运行中实例时才显示选框, 否则只提示 -->
+          <select v-if="hasRunning" v-model="serial" class="input">
+            <option v-for="i in instances" :key="i.serial" :value="i.serial" :disabled="!i.running">
+              {{ i.name }} #{{ i.index }} [{{ i.serial }}] {{ i.running ? 'ONLINE' : 'OFFLINE' }}
+            </option>
+          </select>
+          <div v-else-if="instHint" class="warn-box">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l10 18H2L12 3z"/><path d="M12 10v5M12 18h.01"/>
+            </svg>
+            {{ instHint }}
+          </div>
         </div>
 
         <div class="step">
@@ -227,6 +249,9 @@ function showDetail(f: FlowEvent) {
             </button>
             <button :disabled="!connected || rooted || busy !== ''" @click="ensureRoot">获取 Root</button>
           </div>
+          <div class="row">
+            <button :disabled="!connected || busy !== ''" @click="openShell">打开 ADB Shell</button>
+          </div>
         </div>
 
         <div class="step">
@@ -235,7 +260,7 @@ function showDetail(f: FlowEvent) {
             <button :disabled="!rooted || busy !== ''" @click="detectForeground">取前台应用</button>
             <button :disabled="!rooted || !targetPkg || busy !== ''" @click="diagConnections">连接诊断</button>
           </div>
-          <input v-model="targetPkg" class="input" placeholder="包名, 如 com.gtex.timp" spellcheck="false" />
+          <input v-model="targetPkg" class="input" placeholder="包名" spellcheck="false" />
           <div v-if="foreground" class="hint">{{ foreground }}</div>
           <ul v-if="connDiag.length" class="conn-list">
             <li v-for="(c, i) in connDiag" :key="i">

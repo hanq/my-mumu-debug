@@ -12,6 +12,7 @@ import (
 	"my-mumu-debug/internal/adb"
 	"my-mumu-debug/internal/capture"
 	"my-mumu-debug/internal/certstore"
+	"my-mumu-debug/internal/execx"
 	"my-mumu-debug/internal/mumu"
 )
 
@@ -28,6 +29,11 @@ type App struct {
 func NewApp() *App { return &App{} }
 
 func (a *App) startup(ctx context.Context) { a.ctx = ctx }
+
+// shutdown 应用退出时清理: 停止抓包(杀 mitmdump/清代理), 避免残留进程占用端口。
+func (a *App) shutdown(ctx context.Context) {
+	_ = a.StopCapture()
+}
 
 // log 推送一条步骤日志到前端(步骤面板)。
 func (a *App) log(format string, args ...any) {
@@ -102,6 +108,30 @@ func (a *App) DisconnectDevice(serial string) error {
 	return nil
 }
 
+// OpenAdbShell 打开新的命令行窗口并直接进入指定实例的 adb shell。
+// 使用检测到的 adb(优先 MuMu 自带), 需已通过 ConnectDevice 建立连接。
+//
+// 启动链: 隐藏的 `cmd /c start "" cmd /k adb -s <serial> shell`:
+//   - Go 的 exec 给子进程的 stdin 是 NUL 设备, 直接 CREATE_NEW_CONSOLE 启动
+//     adb shell 会立即读到 EOF 而秒退(窗口一闪而过);
+//   - 由 start 在新可见控制台里拉起 `cmd /k adb ...`, 子进程拿到真实控制台 stdio,
+//     交互可输入, 且 shell 退出后窗口保留(能看到报错, 回到 cmd 提示符)。
+func (a *App) OpenAdbShell(serial string) error {
+	if a.client == nil {
+		return fmt.Errorf("请先执行环境检测")
+	}
+	if serial == "" {
+		return fmt.Errorf("未选择实例")
+	}
+	adbPath := a.client.AdbPath
+	if adbPath == "" {
+		adbPath = "adb"
+	}
+	a.log("打开 ADB Shell 窗口: %s (%s)", serial, adbPath)
+	// 外层 cmd 隐藏执行(不闪黑框), 可见窗口由 start 创建
+	return execx.Command(a.ctx, "cmd", "/c", "start", "", "cmd", "/k", adbPath, "-s", serial, "shell").Start()
+}
+
 // GetForegroundApp 前台应用。
 func (a *App) GetForegroundApp(serial string) (map[string]string, error) {
 	if a.client == nil {
@@ -140,11 +170,11 @@ func (a *App) InstallCertificate(serial, targetPkg string) error {
 	mp := capture.FindMitmdump()
 	if !certstore.CAExists() {
 		if mp == "" {
-			err := fmt.Errorf("未找到 mitmdump, 无法生成 CA; 请先安装 Python + mitmproxy")
+			err := fmt.Errorf("未找到 mitmdump, 无法生成 CA; 请将官方独立版 mitmdump.exe 置于程序目录 mitmdump\\ 下, 或安装 Python + mitmproxy")
 			a.log("%v", err)
 			return err
 		}
-		a.log("CA 不存在, 调用 mitmdump 生成...")
+		a.log("CA 不存在, 调用 mitmdump 生成: %s", mp)
 	}
 	if err := certstore.Install(a.ctx, a.client, serial, mp); err != nil {
 		a.log("证书安装失败: %v", err)
@@ -183,16 +213,10 @@ func (a *App) StartCapture(serial, targetPkg string, port int, skipCert bool) er
 			return err
 		}
 	}
-	// 落盘目录
-	logDir := filepath.Join(configDir(), "logs")
-	_ = os.MkdirAll(logDir, 0755)
-	stamp := time.Now().Format("20060102-150405")
-
+	// 默认不落盘: 流量报文含 token/凭证等敏感信息, 仅内存展示, 避免泄露
 	opts := capture.Options{
-		Serial:   serial,
-		Port:     port,
-		FlowPath: filepath.Join(logDir, "flows-"+stamp+".mitm"),
-		LogPath:  filepath.Join(logDir, "mitmdump-"+stamp+".log"),
+		Serial: serial,
+		Port:   port,
 	}
 	sess, err := capture.Start(a.ctx, opts,
 		func(ev capture.FlowEvent) {

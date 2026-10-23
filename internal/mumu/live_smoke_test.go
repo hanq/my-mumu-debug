@@ -28,7 +28,17 @@ func TestLiveDetectAndCaptureChain(t *testing.T) {
 	if len(instances) == 0 {
 		t.Skip("无实例")
 	}
-	inst := instances[0]
+	// 只对运行中的实例做 adb 链路验证; 全部未开机则跳过(枚举本身已验证)
+	var inst *EmuInstance
+	for i := range instances {
+		if instances[i].Running {
+			inst = &instances[i]
+			break
+		}
+	}
+	if inst == nil {
+		t.Skip("实例均未开机, 跳过实机 adb 链路测试")
+	}
 	t.Logf("实例: #%d %s serial=%s running=%v android=%s",
 		inst.Index, inst.Name, inst.Serial, inst.Running, inst.AndroidVersion)
 	if inst.Serial != "127.0.0.1:16384" {

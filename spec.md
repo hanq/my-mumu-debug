@@ -4,7 +4,7 @@
 
 ## 1. 背景与目标
 
-移动端 APP（如 com.gtex.timp）的 HTTP 接口联调目前依赖手工执行 adb/mitmproxy 命令链
+移动端 APP 的 HTTP 接口联调目前依赖手工执行 adb/mitmproxy 命令链
 （连接 → root → 装证书 → 设代理 → 启 mitmdump → 看日志），步骤多、坑多、不可复用。
 
 **目标**：做一个 Windows 桌面工具，一键完成上述链条，并实时展示目标 APP 的 HTTP 请求/响应内容。
@@ -135,4 +135,4 @@ type FlowEvent struct {                       // addon JSON
 
 - `MuMuManager info -v all` 实例 0：`127.0.0.1:16384`，Android 15，`start_finished`
 - 证书安装后：zygote64/zygote32 两个 ns 均 `certs=146 mitm=1`
-- 已验证抓到：`GET https://gtex-uat.grectronics.cn/api/base/app/user/auth/query_user_info` 200（含 gtex-token 头与 JSON body）
+- 已验证抓到：业务 API 的 GET 请求 200（含业务 token 头与 JSON body）

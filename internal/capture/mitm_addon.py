@@ -8,6 +8,10 @@ from datetime import datetime
 
 from mitmproxy import http, tls
 
+# Windows 管道下 stdout 默认跟随 ANSI 代码页(GBK), 强制 UTF-8 防止中文乱码
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 MAX_BODY = 8000
 BIN_CT = ("image/", "font", "octet-stream", "video/", "audio/")
 
@@ -30,6 +34,11 @@ def _body_text(msg, pretty=False):
         if any(x in ct for x in BIN_CT):
             return "<binary %d bytes, %s>" % (len(raw), ct), False
         text = msg.get_text(strict=False) or ""
+        if "\ufffd" in text:
+            # 按声明字符集解码出现替换符(常见: 未声明 charset 的 GBK 报文), 尝试 GBK 并取替换符更少者
+            gbk = raw.decode("gbk", errors="replace")
+            if gbk.count("\ufffd") < text.count("\ufffd"):
+                text = gbk
         if pretty and "json" in ct:
             try:
                 text = json.dumps(json.loads(text), ensure_ascii=False, indent=2)

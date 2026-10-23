@@ -46,6 +46,10 @@ export function ListThirdPartyPackages(arg1) {
   return window['go']['main']['App']['ListThirdPartyPackages'](arg1);
 }
 
+export function OpenAdbShell(arg1) {
+  return window['go']['main']['App']['OpenAdbShell'](arg1);
+}
+
 export function StartCapture(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['StartCapture'](arg1, arg2, arg3, arg4);
 }
