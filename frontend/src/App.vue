@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import {
   DetectEnvironment, ListInstances, ConnectDevice, DisconnectDevice, EnsureRoot,
   GetForegroundApp, InstallCertificate, StartCapture, StopCapture,
   CaptureRunning, GetProcessConnections, OpenAdbShell,
+  SaveResponseBody, CopyText, HexDump,
+  PauseCapture, ResumeCapture, CapturePaused, ClearFlowBodies,
 } from '../wailsjs/go/main/App'
 import { EventsOn, WindowMinimise, WindowToggleMaximise, Quit } from '../wailsjs/runtime/runtime'
 import type { EmuInstance, FlowEvent, ProcConnection } from './types'
@@ -19,12 +21,13 @@ const rooted = ref(false)
 const foreground = ref('')
 const targetPkg = ref('')
 const capturing = ref(false)
+const paused = ref(false)
 const stepLogs = ref<string[]>([])
 const flows = ref<FlowEvent[]>([])
 const selectedFlow = ref<FlowEvent | null>(null)
 const filterText = ref('')
 const noiseFilter = ref(true)
-const detailTab = ref<'resp' | 'req' | 'headers'>('resp')
+const detailTab = ref<'resp' | 'hex' | 'req' | 'reqhead' | 'resphead'>('resp')
 const connDiag = ref<ProcConnection[]>([])
 const busy = ref('')
 const tab = ref<'flows' | 'logs'>('logs')
@@ -143,8 +146,39 @@ async function stopCapture() {
   await guard('stop', async () => {
     await StopCapture()
     capturing.value = false
+    paused.value = false
     log('抓包已停止, APP 已恢复直连')
   })
+}
+
+// 暂停/恢复记录: 暂停期间流量仍经代理转发(APP 不受影响), 只是不再新增请求行
+async function togglePause() {
+  await guard('pause', async () => {
+    if (paused.value) {
+      await ResumeCapture()
+      paused.value = false
+    } else {
+      await PauseCapture()
+      paused.value = true
+    }
+  })
+}
+
+// 清空 HTTP 请求日志: 同时删除落盘的完整响应体临时文件(否则文件会持续堆积)
+async function clearFlows() {
+  flows.value = []
+  selectedFlow.value = null
+  rowMenu.value = null
+  copyMenuOpen.value = false
+  resetHex()
+  await guard('clear', async () => {
+    await ClearFlowBodies()
+    log('HTTP 请求日志已清空')
+  })
+}
+
+function clearLogs() {
+  stepLogs.value = []
 }
 
 async function diagConnections() {
@@ -155,17 +189,36 @@ async function diagConnections() {
 }
 
 // ---------- 事件 ----------
+let evSeq = 0
 onMounted(() => {
   EventsOn('env:log', (msg: string) => log(msg))
   EventsOn('capture:flow', (ev: FlowEvent) => {
-    flows.value.push(ev)
+    ev._id = ++evSeq
+    if (ev.type === 'flow') {
+      // 同 method+URL 的 pending 行(仅有请求无响应)原地替换为完成态: 一行 = 一个请求。
+      // OPTIONS 预检与真实请求 method 不同, 各自成行, 不再把同一请求显示成两行
+      const i = flows.value.findIndex(f => f.type === 'request' && f.method === ev.method && f.url === ev.url)
+      if (i >= 0) {
+        if (selectedFlow.value === flows.value[i]) selectedFlow.value = ev
+        flows.value.splice(i, 1, ev)
+      } else {
+        flows.value.push(ev)
+      }
+    } else {
+      flows.value.push(ev)
+    }
     if (flows.value.length > 2000) flows.value.shift()
   })
   EventsOn('capture:exit', (reason: string) => {
     capturing.value = false
+    paused.value = false
     log(`mitmdump 退出: ${reason}`)
   })
   CaptureRunning().then((r: boolean) => { capturing.value = r })
+  CapturePaused().then((p: boolean) => { paused.value = p })
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { rowMenu.value = null; copyMenuOpen.value = false; lightboxUrl.value = '' }
+  })
 })
 
 // ---------- 派生 ----------
@@ -188,6 +241,235 @@ function statusClass(s: number): string {
 function showDetail(f: FlowEvent) {
   selectedFlow.value = f
   detailTab.value = 'resp'
+  resetHex()
+}
+
+// 重置 HEX 查看器状态(切换请求/清空列表后按需重新加载)
+function resetHex() {
+  hexText.value = ''
+  hexLoaded.value = 0
+  hexHasMore.value = false
+  hexTotal.value = 0
+  hexLoadedKey = ''
+}
+
+// ---------- 媒体预览 ----------
+const lightboxUrl = ref('')
+
+// 响应是否为可预览媒体(图片/视频/音频)
+function mediaKind(f: FlowEvent | null): 'image' | 'video' | 'audio' | null {
+  if (!f || f.type !== 'flow') return null
+  const ct = f.resp_content_type || ''
+  if (ct.startsWith('image/')) return 'image'
+  if (ct.startsWith('video/')) return 'video'
+  if (ct.startsWith('audio/')) return 'audio'
+  return null
+}
+
+function mediaDataUrl(f: FlowEvent): string {
+  return `data:${f.resp_content_type || 'application/octet-stream'};base64,${f.resp_body_b64}`
+}
+
+function fmtSize(n: number): string {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB'
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB'
+  return n + ' B'
+}
+
+// 媒体大小: 已内联按 base64 长度还原, 未内联从占位文本(<binary N bytes>)提取
+function mediaSizeText(f: FlowEvent): string {
+  if (f.resp_body_b64) return fmtSize(Math.floor(f.resp_body_b64.length * 3 / 4))
+  const m = /<binary (\d+) bytes/.exec(f.resp_body || '')
+  return m ? fmtSize(parseInt(m[1], 10)) : '未知大小'
+}
+
+// ---------- 另存为 / 复制为 ----------
+const copyMenuOpen = ref(false)
+
+const CT_EXT: Record<string, string> = {
+  'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp',
+  'image/svg+xml': '.svg', 'image/bmp': '.bmp', 'image/vnd.microsoft.icon': '.ico',
+  'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov',
+  'audio/mpeg': '.mp3', 'audio/aac': '.aac', 'audio/ogg': '.ogg', 'audio/wav': '.wav',
+  'application/json': '.json', 'text/html': '.html', 'text/plain': '.txt',
+  'text/css': '.css', 'text/xml': '.xml', 'application/xml': '.xml',
+  'application/javascript': '.js', 'application/pdf': '.pdf', 'application/octet-stream': '.bin',
+}
+
+function extOf(ct: string): string {
+  return CT_EXT[(ct || '').split(';')[0].trim().toLowerCase()] ?? ''
+}
+
+// 另存默认文件名: URL 路径末段 + 按 content-type 推断的扩展名
+function suggestedName(f: FlowEvent): string {
+  let name = ''
+  try {
+    name = decodeURIComponent(new URL(f.url).pathname.split('/').pop() || '')
+  } catch {
+    name = ''
+  }
+  name = name.split('?')[0].replace(/[\\/:*?"<>|]/g, '_').slice(0, 80)
+  if (!name) name = 'response'
+  const ext = extOf(f.resp_content_type)
+  if (ext && !name.toLowerCase().endsWith(ext)) name += ext
+  return name
+}
+
+async function saveResponse() {
+  const f = selectedFlow.value
+  if (!f?.resp_body_file) return
+  await guard('save', async () => {
+    const p: string = await SaveResponseBody(f.resp_body_file, suggestedName(f))
+    if (p) log(`响应体已另存: ${p}`)
+  })
+}
+
+// 命令生成: 跳过 HTTP/2 伪头(:开头); body 为二进制占位/解码失败时不可复现, 省略
+function cmdHeaders(f: FlowEvent): [string, string][] {
+  return Object.entries(f.req_headers || {}).filter(([k]) => k && !k.startsWith(':'))
+}
+
+function usableBody(f: FlowEvent): string {
+  const b = f.req_body || ''
+  if (!b || b.startsWith('<binary ') || b.startsWith('<body decode error')) return ''
+  return b
+}
+
+function shQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+function psQuote(s: string): string {
+  return `'${s.replace(/'/g, `''`)}'`
+}
+
+function toCurl(f: FlowEvent): string {
+  const lines: string[] = [`curl ${shQuote(f.url)}`]
+  if (f.method && f.method !== 'GET') lines.push(`-X ${f.method}`)
+  for (const [k, v] of cmdHeaders(f)) lines.push(`-H ${shQuote(`${k}: ${v}`)}`)
+  const b = usableBody(f)
+  if (b) lines.push(`--data-raw ${shQuote(b)}`)
+  return lines.join(' \\\n  ')
+}
+
+function toPowerShell(f: FlowEvent): string {
+  const hdrs = cmdHeaders(f)
+  const ct = hdrs.find(([k]) => k.toLowerCase() === 'content-type')
+  const rest = hdrs.filter(([k]) => k.toLowerCase() !== 'content-type')
+  const out: string[] = []
+  if (rest.length) {
+    out.push(`$headers = @{ ${rest.map(([k, v]) => `${psQuote(k)}=${psQuote(v)}`).join('; ')} }`)
+  }
+  const seg = [`Invoke-WebRequest -Uri ${psQuote(f.url)}`]
+  if (f.method && f.method !== 'GET') seg.push(`-Method ${f.method}`)
+  if (rest.length) seg.push('-Headers $headers')
+  if (ct) seg.push(`-ContentType ${psQuote(ct[1])}`)
+  const b = usableBody(f)
+  if (b) seg.push(`-Body ${psQuote(b)}`)
+  out.push(seg.join(' '))
+  return out.join('\n')
+}
+
+async function copyAs(kind: 'curl' | 'ps') {
+  copyMenuOpen.value = false
+  const f = selectedFlow.value
+  if (!f) return
+  await guard('copy', async () => {
+    await CopyText(kind === 'curl' ? toCurl(f) : toPowerShell(f))
+    log(`已复制为 ${kind === 'curl' ? 'cURL' : 'PowerShell'}: ${f.method} ${f.url.slice(0, 100)}`)
+  })
+}
+
+// ---------- HEX 查看器(响应体十六进制, 64KB 分页) ----------
+const HEX_CHUNK = 65536
+const hexText = ref('')
+const hexLoading = ref(false)
+const hexLoaded = ref(0)
+const hexHasMore = ref(false)
+const hexTotal = ref(0)
+let hexLoadedKey = ''
+
+watch(detailTab, (t) => {
+  if (t === 'hex') void ensureHex(false)
+})
+
+async function ensureHex(more = false) {
+  const f = selectedFlow.value
+  if (!f?.resp_body_file || hexLoading.value) return
+  const off = more ? hexLoaded.value : 0
+  if (!more && hexLoadedKey === `${f._id}@0`) return
+  hexLoading.value = true
+  try {
+    const r = await HexDump(f.resp_body_file, off, HEX_CHUNK)
+    if (selectedFlow.value !== f) return // 加载期间已切换选中项
+    hexText.value = more ? hexText.value + r.text : r.text
+    hexLoaded.value = r.next_offset
+    hexHasMore.value = r.has_more
+    hexTotal.value = r.total
+    if (!more) hexLoadedKey = `${f._id}@0`
+  } catch (e: any) {
+    log(`HEX 查看失败: ${e}`)
+  } finally {
+    hexLoading.value = false
+  }
+}
+
+// 头部展示: name: value 行式(比 JSON.stringify 可读)
+function headersText(h: Record<string, string> | undefined): string {
+  if (!h || !Object.keys(h).length) return ''
+  return Object.entries(h).map(([k, v]) => `${k}: ${v}`).join('\n')
+}
+
+function fmtHeaders(h: Record<string, string> | undefined): string {
+  return headersText(h) || '(空)'
+}
+
+// ---------- 请求行右键菜单: 复制 URL / cURL / 请求头 / 响应头 / 响应体 ----------
+const rowMenu = ref<{ x: number; y: number; flow: FlowEvent } | null>(null)
+
+function openRowMenu(e: MouseEvent, f: FlowEvent) {
+  showDetail(f)
+  const W = 210, H = 250
+  rowMenu.value = {
+    x: Math.min(e.clientX, window.innerWidth - W),
+    y: Math.min(e.clientY, window.innerHeight - H),
+    flow: f,
+  }
+}
+
+// 响应体可复制文本: 文本 body 直接用; 二进制(图片/音视频)用内联 base64 data URL 兜底
+function bodyForCopy(f: FlowEvent): string {
+  const b = f.resp_body || ''
+  if (b && !b.startsWith('<binary ') && !b.startsWith('<body decode error')) {
+    return f.truncated ? `${b}\n...[已截断]` : b
+  }
+  if (f.resp_body_b64) {
+    return `data:${f.resp_content_type || 'application/octet-stream'};base64,${f.resp_body_b64}`
+  }
+  return b
+}
+
+async function copyFromMenu(kind: 'url' | 'curl' | 'reqhead' | 'resphead' | 'respbody') {
+  const f = rowMenu.value?.flow
+  rowMenu.value = null
+  if (!f) return
+  let text = ''
+  let label = ''
+  switch (kind) {
+    case 'url': text = f.url || ''; label = 'URL'; break
+    case 'curl': text = toCurl(f); label = 'cURL'; break
+    case 'reqhead': text = headersText(f.req_headers); label = '请求头'; break
+    case 'resphead': text = headersText(f.resp_headers); label = '响应头'; break
+    case 'respbody': text = bodyForCopy(f); label = '响应体'; break
+  }
+  if (!text) {
+    log(`无可复制的${label || '内容'} (${f.method || '-'} ${f.url || ''})`)
+    return
+  }
+  await guard('copy', async () => {
+    await CopyText(text)
+    log(`已复制${label}: ${f.method || ''} ${(f.url || '').slice(0, 100)}`)
+  })
 }
 </script>
 
@@ -277,8 +559,11 @@ function showDetail(f: FlowEvent) {
             </button>
             <button class="danger" :disabled="!capturing || busy !== ''" @click="stopCapture">停止</button>
           </div>
+          <button class="ghost" :disabled="!capturing || busy !== ''" :class="{ 'pause-on': paused }" @click="togglePause">
+            {{ paused ? '恢复抓包' : '暂停抓包' }}
+          </button>
           <button class="ghost" :disabled="!rooted || busy !== ''" @click="installCert">仅重装证书(幂等)</button>
-          <p class="note">抓取 HTTP 请求/响应。IM 私有协议长连接不走代理, 不在抓包范围。</p>
+          <p class="note">抓取 HTTP 请求/响应。IM 私有协议长连接不走代理, 不在抓包范围。暂停期间流量仍正常转发。</p>
         </div>
       </aside>
 
@@ -291,8 +576,8 @@ function showDetail(f: FlowEvent) {
           <button :class="{ act: tab === 'logs' }" @click="tab = 'logs'">
             运行日志 <em>{{ stepLogs.length }}</em>
           </button>
-          <div class="tab-status" :class="capturing ? 'live' : ''">
-            {{ capturing ? '● CAPTURE ACTIVE' : '○ IDLE' }}
+          <div class="tab-status" :class="paused ? 'paused' : capturing ? 'live' : ''">
+            {{ paused ? 'PAUSED — 记录已暂停' : capturing ? '● CAPTURE ACTIVE' : '○ IDLE' }}
           </div>
         </div>
 
@@ -301,6 +586,13 @@ function showDetail(f: FlowEvent) {
           <div class="flows-toolbar">
             <input v-model="filterText" class="input" placeholder="URL 过滤..." spellcheck="false" />
             <label class="chk"><input type="checkbox" v-model="noiseFilter" /> 屏蔽统计噪声</label>
+            <button class="tool-btn" :disabled="!flows.length || busy !== ''"
+                    title="清空请求列表, 同时删除落盘的响应体临时文件" @click="clearFlows">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v5M14 11v5"/>
+              </svg>
+              清空请求
+            </button>
           </div>
           <div class="flow-table">
             <table>
@@ -311,10 +603,11 @@ function showDetail(f: FlowEvent) {
                 <tr v-if="!visibleFlows.length">
                   <td colspan="5" class="empty">NO DATA — 完成左侧操作序列并在模拟器中操作应用</td>
                 </tr>
-                <tr v-for="(f, i) in visibleFlows" :key="visibleFlows.length - i"
-                    :class="{ sel: selectedFlow === f }" @click="showDetail(f)">
+                <tr v-for="f in visibleFlows" :key="f._id"
+                    :class="{ sel: selectedFlow === f }" @click="showDetail(f)"
+                    @contextmenu.prevent="openRowMenu($event, f)">
                   <td class="mono">{{ f.ts }}</td>
-                  <td><span class="method">{{ f.type === 'tls_fail' ? 'TLS!' : f.method }}</span></td>
+                  <td><span class="method" :class="f.type === 'tls_fail' ? 'm-tls' : 'm-' + f.method.toLowerCase()">{{ f.type === 'tls_fail' ? 'TLS!' : f.method }}</span></td>
                   <td class="url mono">{{ f.type === 'tls_fail' ? `TLS握手失败: ${f.sni}` : f.url }}</td>
                   <td><span class="status" :class="statusClass(f.status)">{{ f.status || '-' }}</span></td>
                   <td class="mono">{{ f.duration_ms ? f.duration_ms + 'ms' : '' }}</td>
@@ -323,21 +616,83 @@ function showDetail(f: FlowEvent) {
             </table>
           </div>
 
+          <!-- 复制为下拉的点击外部关闭层 -->
+          <div v-if="copyMenuOpen && selectedFlow" class="menu-backdrop" @click="copyMenuOpen = false"></div>
+
           <div v-if="selectedFlow" class="detail">
             <div class="detail-tabs">
               <button :class="{ act: detailTab === 'resp' }" @click="detailTab = 'resp'">响应体</button>
+              <button :class="{ act: detailTab === 'hex' }" :disabled="!selectedFlow.resp_body_file"
+                      title="响应体十六进制(HEX)查看" @click="detailTab = 'hex'">HEX</button>
               <button :class="{ act: detailTab === 'req' }" @click="detailTab = 'req'">请求体</button>
-              <button :class="{ act: detailTab === 'headers' }" @click="detailTab = 'headers'">请求头</button>
-              <button class="close" @click="selectedFlow = null">关闭</button>
+              <button :class="{ act: detailTab === 'reqhead' }" @click="detailTab = 'reqhead'">请求头</button>
+              <button :class="{ act: detailTab === 'resphead' }" @click="detailTab = 'resphead'">响应头</button>
+              <div class="dt-actions">
+                <button class="dt-action" :disabled="!selectedFlow.resp_body_file"
+                        :title="selectedFlow.resp_body_file ? '将完整响应体另存到磁盘' : '无完整响应体(pending/空 body/超过 256MB 未落盘)'"
+                        @click="saveResponse">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
+                  另存为
+                </button>
+                <div class="copy-wrap">
+                  <button class="dt-action" :disabled="!selectedFlow.url" title="复制请求为命令行" @click.stop="copyMenuOpen = !copyMenuOpen">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="1"/><path d="M5 15V5a1 1 0 0 1 1-1h10"/></svg>
+                    复制为
+                    <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                  </button>
+                  <div v-if="copyMenuOpen" class="copy-menu">
+                    <button @click="copyAs('curl')">cURL (bash)</button>
+                    <button @click="copyAs('ps')">PowerShell</button>
+                  </div>
+                </div>
+                <button class="close" @click="selectedFlow = null; copyMenuOpen = false">关闭</button>
+              </div>
             </div>
-            <pre v-if="detailTab === 'resp'" class="body">{{ selectedFlow.resp_body || '(空)' }}{{ selectedFlow.truncated ? '\n...[已截断]' : '' }}</pre>
-            <pre v-else-if="detailTab === 'req'" class="body">{{ selectedFlow.req_body || '(空)' }}</pre>
-            <pre v-else class="body">{{ JSON.stringify(selectedFlow.req_headers, null, 2) }}</pre>
+            <!-- 媒体响应: 图片直接预览(点击看原图), 视频/音频点击播放 -->
+            <div v-if="detailTab === 'resp' && mediaKind(selectedFlow)" class="media-view">
+              <div class="media-meta">
+                <span class="mono">{{ selectedFlow.resp_content_type }}</span> · {{ mediaSizeText(selectedFlow) }}
+                <template v-if="!selectedFlow.resp_body_b64"> · 超过 8MB 未内联, 无预览</template>
+                <template v-else-if="mediaKind(selectedFlow) === 'image'"> · 点击图片查看原图</template>
+                <template v-else> · 点击播放</template>
+              </div>
+              <img v-if="selectedFlow.resp_body_b64 && mediaKind(selectedFlow) === 'image'"
+                   class="media-img" :src="mediaDataUrl(selectedFlow)"
+                   @click="lightboxUrl = mediaDataUrl(selectedFlow)" />
+              <video v-else-if="selectedFlow.resp_body_b64 && mediaKind(selectedFlow) === 'video'"
+                     class="media-video" :src="mediaDataUrl(selectedFlow)"
+                     controls preload="metadata"></video>
+              <audio v-else-if="selectedFlow.resp_body_b64 && mediaKind(selectedFlow) === 'audio'"
+                     :src="mediaDataUrl(selectedFlow)" controls></audio>
+              <pre v-else class="body">{{ selectedFlow.resp_body || '(空)' }}{{ selectedFlow.truncated ? '\n...[已截断]' : '' }}</pre>
+            </div>
+            <pre v-else-if="detailTab === 'resp'" class="body">{{ selectedFlow.resp_body || '(空)' }}{{ selectedFlow.truncated ? '\n...[已截断]' : '' }}</pre>
+            <pre v-else-if="detailTab === 'req'" class="body">{{ selectedFlow.req_body || '(空)' }}{{ selectedFlow.req_truncated ? '\n...[已截断]' : '' }}</pre>
+            <pre v-else-if="detailTab === 'reqhead'" class="body">{{ fmtHeaders(selectedFlow.req_headers) }}</pre>
+            <pre v-else-if="detailTab === 'resphead'" class="body">{{ fmtHeaders(selectedFlow.resp_headers) }}</pre>
+            <div v-else-if="detailTab === 'hex'" class="hex-pane">
+              <div class="hex-meta">
+                {{ selectedFlow.resp_content_type || 'application/octet-stream' }} · 共 {{ fmtSize(hexTotal || selectedFlow.resp_body_size) }}
+                <template v-if="hexLoaded"> · 已加载 {{ fmtSize(hexLoaded) }}</template>
+              </div>
+              <pre class="body hexbody">{{ hexText || (hexLoading ? '加载中...' : '(空)') }}</pre>
+              <button v-if="hexHasMore" class="hex-more" :disabled="hexLoading" @click="ensureHex(true)">
+                {{ hexLoading ? '加载中...' : '加载更多' }}
+              </button>
+            </div>
           </div>
         </div>
 
         <!-- TAB: 日志 -->
         <div v-show="tab === 'logs'" class="tab-pane tab-logs">
+          <div class="logs-toolbar">
+            <button class="tool-btn" :disabled="!stepLogs.length" title="清空运行日志" @click="clearLogs">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v5M14 11v5"/>
+              </svg>
+              清空日志
+            </button>
+          </div>
           <div class="logs-full">
             <div v-for="(l, i) in stepLogs" :key="i" class="logline">{{ l }}</div>
             <div v-if="!stepLogs.length" class="empty">NO LOG</div>
@@ -351,7 +706,28 @@ function showDetail(f: FlowEvent) {
       <span>SERIAL: <b>{{ serial || '---' }}</b></span>
       <span>PORT: <b>8888</b></span>
       <span>PKG: <b>{{ targetPkg || '---' }}</b></span>
-      <span class="right" :class="capturing ? 'live' : ''">{{ capturing ? 'CAPTURE ACTIVE' : 'STANDBY' }}</span>
+      <span class="right" :class="paused ? 'paused' : capturing ? 'live' : ''">{{ paused ? 'PAUSED' : capturing ? 'CAPTURE ACTIVE' : 'STANDBY' }}</span>
     </footer>
+
+    <!-- 请求行右键菜单 -->
+    <div v-if="rowMenu" class="menu-backdrop" @click="rowMenu = null" @contextmenu.prevent="rowMenu = null"></div>
+    <div v-if="rowMenu" class="ctx-menu" :style="{ left: rowMenu.x + 'px', top: rowMenu.y + 'px' }" @contextmenu.prevent>
+      <div class="ctx-title">
+        <b>{{ rowMenu.flow.type === 'tls_fail' ? 'TLS!' : rowMenu.flow.method || '-' }}</b>
+        <span>{{ rowMenu.flow.status || 'pending' }}</span>
+      </div>
+      <button :disabled="!rowMenu.flow.url" @click="copyFromMenu('url')">复制 URL</button>
+      <button :disabled="!rowMenu.flow.url" @click="copyFromMenu('curl')">复制为 cURL</button>
+      <div class="ctx-sep"></div>
+      <button :disabled="!rowMenu.flow.req_headers" @click="copyFromMenu('reqhead')">复制请求头</button>
+      <button :disabled="!rowMenu.flow.resp_headers" @click="copyFromMenu('resphead')">复制响应头</button>
+      <button :disabled="!rowMenu.flow.resp_body && !rowMenu.flow.resp_body_b64" @click="copyFromMenu('respbody')">复制响应体</button>
+    </div>
+
+    <!-- 图片灯箱(点击任意处关闭) -->
+    <div v-if="lightboxUrl" class="lightbox" @click="lightboxUrl = ''">
+      <img :src="lightboxUrl" alt="原图预览" />
+      <div class="lightbox-tip">点击任意处关闭</div>
+    </div>
   </div>
 </template>

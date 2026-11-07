@@ -23,6 +23,29 @@ export namespace adb {
 
 }
 
+export namespace main {
+	
+	export class HexDumpResult {
+	    text: string;
+	    next_offset: number;
+	    has_more: boolean;
+	    total: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new HexDumpResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.text = source["text"];
+	        this.next_offset = source["next_offset"];
+	        this.has_more = source["has_more"];
+	        this.total = source["total"];
+	    }
+	}
+
+}
+
 export namespace mumu {
 	
 	export class EmuInstance {

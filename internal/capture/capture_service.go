@@ -42,13 +42,18 @@ type FlowEvent struct {
 	ReqHeaders  map[string]string `json:"req_headers"`
 	RespHeaders map[string]string `json:"resp_headers"`
 	ReqBody     string            `json:"req_body"`
-	RespBody    string            `json:"resp_body"`
-	Truncated   bool              `json:"truncated"`
-	Direction   string            `json:"direction"`
-	Content     string            `json:"content"`
-	Side        string            `json:"side"`
-	SNI         string            `json:"sni"`
-	Error       string            `json:"error"`
+	ReqTruncated      bool   `json:"req_truncated"`
+	RespBody          string `json:"resp_body"`
+	RespBodyB64       string `json:"resp_body_b64"`       // 图片/音视频内联 base64(≤8MB, 空=未内联)
+	RespContentType   string `json:"resp_content_type"`   // 响应 content-type(去参数小写)
+	RespBodyFile      string `json:"resp_body_file"`      // 完整响应体落盘路径(空=未落盘)
+	RespBodySize      int64  `json:"resp_body_size"`      // 完整响应体字节数
+	Truncated         bool   `json:"truncated"`
+	Direction         string `json:"direction"`
+	Content           string `json:"content"`
+	Side              string `json:"side"`
+	SNI               string `json:"sni"`
+	Error             string `json:"error"`
 }
 
 // FindMitmdump 按优先级查找 mitmdump:
@@ -155,6 +160,50 @@ func killByPort(port int) error {
 	return execx.Command(context.Background(), "taskkill", "/F", "/PID", fmt.Sprint(pid)).Run()
 }
 
+// FlowBodyDir 完整响应体临时目录(%TEMP%\my-mumu-debug\flowbodies, 与 addon 侧 tempfile.gettempdir() 一致)。
+func FlowBodyDir() string {
+	return filepath.Join(os.TempDir(), "my-mumu-debug", "flowbodies")
+}
+
+var flowBodyFileRe = regexp.MustCompile(`^\d+\.body$`)
+
+// IsFlowBodyPath 是否为本工具落盘的响应体临时文件路径(目录内 <id>.body)。
+func IsFlowBodyPath(p string) bool {
+	return flowBodyFileRe.MatchString(filepath.Base(p))
+}
+
+// CleanFlowBodies 清理响应体临时文件(仅删专用目录内 <id>.body, 不触碰其他内容)。
+// 开抓包时清上次会话遗留; 前端清空请求列表时也调用, 避免临时文件无限堆积。
+func CleanFlowBodies() {
+	entries, err := os.ReadDir(FlowBodyDir())
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() && flowBodyFileRe.MatchString(e.Name()) {
+			_ = os.Remove(filepath.Join(FlowBodyDir(), e.Name()))
+		}
+	}
+}
+
+// PauseMarkerPath 暂停记录的标记文件路径。addon 侧按同一路径轮询判断。
+func PauseMarkerPath() string {
+	return filepath.Join(os.TempDir(), "my-mumu-debug_capture_paused")
+}
+
+// SetPaused 写入/删除暂停标记。暂停期间 addon 不上报任何事件, 但流量仍正常转发,
+// 目标 APP 的网络行为不受影响(与"停止抓包"清代理不同)。
+func SetPaused(paused bool) error {
+	p := PauseMarkerPath()
+	if paused {
+		return os.WriteFile(p, []byte("1"), 0644)
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // Session 一次抓包会话。
 type Session struct {
 	cmd    *exec.Cmd
@@ -191,6 +240,8 @@ func Start(ctx context.Context, opts Options,
 	if err != nil {
 		return nil, err
 	}
+	_ = SetPaused(false) // 清掉上次会话异常退出可能残留的暂停标记
+	CleanFlowBodies()    // 清理上次会话遗留的响应体临时文件(仅限专用目录内 <id>.body)
 	args := []string{
 		"-s", addonPath,
 		"--listen-host", "0.0.0.0",
@@ -225,7 +276,8 @@ func Start(ctx context.Context, opts Options,
 
 	go func() { // 事件解析循环
 		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 单行上限 1MB(addon 已截断 body)
+		// 单行上限 32MB: 文本 body addon 截断 8000 字符, 图片/音视频内联 base64 上限 8MB(编码后约 10.7MB)
+		sc.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
 			if !strings.HasPrefix(line, "{") {
@@ -248,6 +300,7 @@ func (s *Session) Stop() error {
 	if s == nil || s.cmd == nil || s.cmd.Process == nil {
 		return nil
 	}
+	_ = SetPaused(false) // 会话结束即解除暂停标记, 避免下次启动被误判为暂停
 	_ = s.cmd.Process.Kill()
 	s.cancel()
 	_ = s.cmd.Wait()

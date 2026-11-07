@@ -6,12 +6,24 @@ export function CAExists() {
   return window['go']['main']['App']['CAExists']();
 }
 
+export function CapturePaused() {
+  return window['go']['main']['App']['CapturePaused']();
+}
+
 export function CaptureRunning() {
   return window['go']['main']['App']['CaptureRunning']();
 }
 
+export function ClearFlowBodies() {
+  return window['go']['main']['App']['ClearFlowBodies']();
+}
+
 export function ConnectDevice(arg1) {
   return window['go']['main']['App']['ConnectDevice'](arg1);
+}
+
+export function CopyText(arg1) {
+  return window['go']['main']['App']['CopyText'](arg1);
 }
 
 export function DetectEnvironment() {
@@ -34,6 +46,10 @@ export function GetProcessConnections(arg1, arg2) {
   return window['go']['main']['App']['GetProcessConnections'](arg1, arg2);
 }
 
+export function HexDump(arg1, arg2, arg3) {
+  return window['go']['main']['App']['HexDump'](arg1, arg2, arg3);
+}
+
 export function InstallCertificate(arg1, arg2) {
   return window['go']['main']['App']['InstallCertificate'](arg1, arg2);
 }
@@ -48,6 +64,18 @@ export function ListThirdPartyPackages(arg1) {
 
 export function OpenAdbShell(arg1) {
   return window['go']['main']['App']['OpenAdbShell'](arg1);
+}
+
+export function PauseCapture() {
+  return window['go']['main']['App']['PauseCapture']();
+}
+
+export function ResumeCapture() {
+  return window['go']['main']['App']['ResumeCapture']();
+}
+
+export function SaveResponseBody(arg1, arg2) {
+  return window['go']['main']['App']['SaveResponseBody'](arg1, arg2);
 }
 
 export function StartCapture(arg1, arg2, arg3, arg4) {

@@ -4,6 +4,7 @@ package mumu
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 
@@ -41,8 +42,9 @@ func TestLiveDetectAndCaptureChain(t *testing.T) {
 	}
 	t.Logf("实例: #%d %s serial=%s running=%v android=%s",
 		inst.Index, inst.Name, inst.Serial, inst.Running, inst.AndroidVersion)
-	if inst.Serial != "127.0.0.1:16384" {
-		t.Errorf("serial = %s, want 127.0.0.1:16384", inst.Serial)
+	// serial 随网络模式变化: NAT=127.0.0.1:16384(+32n), 桥接=<局域网IP>:5555, 只验证 host:port 形态
+	if _, _, err := net.SplitHostPort(inst.Serial); err != nil {
+		t.Errorf("serial 形态异常(应为 host:port): %s", inst.Serial)
 	}
 
 	// adb 链路

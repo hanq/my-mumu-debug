@@ -43,6 +43,12 @@
 - 一键开启：装证书（可选跳过，若已装）→ 设代理 → 按端口启动 mitmdump 副进程（addon JSON 事件流）
 - 一键停止：清代理(`:0`) → 按端口杀 mitmdump → 保留 flows 文件
 - 实时列表：时间、方法、URL、状态码、耗时；点击查看请求头/请求体/响应头/响应体（自动解压+JSON 美化）
+- 一行=一个请求：完成事件按 method+URL 原地替换 pending 行；OPTIONS 预检独立成行，方法分色徽标一眼区分
+- 媒体预览：图片响应直接预览（点击灯箱看原图），视频/音频内联点播（≤8MB，超过仅提示大小）
+- 另存为：详情面板可将完整响应体（解压后 ≤256MB）另存到磁盘；临时文件位于 `%TEMP%\my-mumu-debug\flowbodies`，每次开启抓包自动清理
+- HEX 查看器：响应体十六进制视图（xxd 风格，64KB 分页“加载更多”）
+- 头部完整展示：请求头/响应头独立标签页，显示全部原始头（含 host/content-length/connection/accept-encoding）
+- 复制为：请求一键复制为 cURL(bash) / PowerShell(Invoke-WebRequest) 命令（含方法/请求头/请求体，二进制体省略）
 - 过滤：按 URL 关键字、方法、状态码；屏蔽噪声域名（如 tongji-collector.dcloud.net.cn）
 - 落盘：会话日志 + `flows.mitm`（可用 `mitmweb -r` 回放），存放于 `%APPDATA%/my-mumu-debug/logs/`
 - 异常事件：TLS 握手失败（提示可能存在证书绑定）、mitmdump 异常退出
@@ -81,7 +87,7 @@
 - 所有 adb/MuMuManager 调用带 `context.WithTimeout`（connect 5s / root 10s / dumpsys 5s / MuMuManager 5s）
 - subject_hash_old 用 Go 实现：`MD5(RawSubject)` 前 4 字节小端 uint32 → `%08x`（需用实机 CA 对拍 `c8750f0d` 校验，见 docs/research/02）
 - mitmdump 启停：启动前查端口占用；停止按端口反查 PID；不按镜像名杀
-- 事件单行 JSON ≤1MB（addon 侧已截断 body），Go Scanner 缓冲 1MB
+- 事件单行 JSON：文本 body 截断 8000 字符；图片/音视频 ≤8MB 额外内联 base64（单行峰值约 11MB），Go Scanner 缓冲 32MB
 
 ## 4. 数据结构（核心）
 

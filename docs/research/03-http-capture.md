@@ -48,7 +48,7 @@ socket 归 python 子进程持有：
 ## 4. addon 事件流设计
 
 Python addon（`mitm_addon.py`）将每个事件输出为**一行 JSON 到 stdout**，
-Go 侧 `bufio.Scanner`（缓冲 ≥1MB）逐行解析 → Wails 事件推送到前端：
+Go 侧 `bufio.Scanner`（缓冲 32MB）逐行解析 → Wails 事件推送到前端：
 
 ```json
 {"type":"response","ts":"10-22 12:17:43","method":"GET","url":"https://...","status":200,"duration_ms":142,"req_headers":{...},"req_body":"","resp_headers":{...},"resp_body":"{...}","truncated":false}
@@ -56,8 +56,11 @@ Go 侧 `bufio.Scanner`（缓冲 ≥1MB）逐行解析 → Wails 事件推送到�
 
 addon 要点（继承实测脚本）：
 - 响应体 `get_text()` 自动解 gzip；JSON 再 `json.dumps(indent=2)` 美化
-- 二进制 content-type（image/font/octet-stream/video/audio）只记类型+字节数
+- 二进制 content-type（image/font/octet-stream/video/audio）只记类型+字节数；图片/音视频 ≤8MB 额外内联 base64（`resp_body_b64`）供前端预览
+- 完整响应体（解压后 ≤256MB）写临时文件 `%TEMP%\my-mumu-debug\flowbodies\<id>.body`，事件带 `resp_body_file`/`resp_body_size` 供前端"另存为"；Go 侧每次 Start 前清理该目录（仅删 `<id>.body`）
+- 同一请求先后产生 `request`(pending) 与 `flow`(完成) 两个事件，前端按 method+URL 原地合并为一行（一行=一个请求，OPTIONS 预检独立成行）
 - 单 body 截断 8000 字符，`truncated:true` 标注
+- 暂停/恢复：Go 侧写/删标记文件 `%TEMP%\my-mumu-debug_capture_paused`，addon 每 0.3s 轮询一次，标记存在时所有钩子直接 `return`（不上报），流量仍正常经代理转发；Start/Stop 都会清除标记，避免异常退出后残留导致一直“暂停”
 - WebSocket：`websocket_message` 钩子，方向 `C->S`/`S->C`
 - TLS 失败：`tls_failed_client/server` 钩子（识别证书绑定/不信任）
 - stdout 必须**无缓冲**（环境变量 `PYTHONUNBUFFERED=1`），否则日志延迟/丢失

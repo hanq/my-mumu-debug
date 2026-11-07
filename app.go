@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -18,12 +21,13 @@ import (
 
 // App Wails 绑定层: 仅做编排与事件推送, 业务在各 internal 包。
 type App struct {
-	ctx      context.Context
-	mumuInfo mumu.InstallInfo
-	client   *adb.Client
-	serial   string
-	session  *capture.Session
+	ctx       context.Context
+	mumuInfo  mumu.InstallInfo
+	client    *adb.Client
+	serial    string
+	session   *capture.Session
 	capturing bool
+	paused    bool
 }
 
 func NewApp() *App { return &App{} }
@@ -226,6 +230,7 @@ func (a *App) StartCapture(serial, targetPkg string, port int, skipCert bool) er
 		},
 		func(err error) {
 			a.capturing = false
+			a.paused = false
 			if a.ctx != nil {
 				runtime.EventsEmit(a.ctx, "capture:exit", fmt.Sprint(err))
 			}
@@ -236,14 +241,16 @@ func (a *App) StartCapture(serial, targetPkg string, port int, skipCert bool) er
 	}
 	a.session = sess
 	a.capturing = true
+	a.paused = false
 
-	if err := a.client.SetGlobalProxy(a.ctx, serial, fmt.Sprintf("10.0.2.2:%d", port)); err != nil {
+	proxyHost := proxyHostFor(serial)
+	if err := a.client.SetGlobalProxy(a.ctx, serial, fmt.Sprintf("%s:%d", proxyHost, port)); err != nil {
 		_ = sess.Stop()
 		a.capturing = false
 		a.log("设置代理失败: %v", err)
 		return err
 	}
-	a.log("抓包已开启: mitmdump :%d, 代理 10.0.2.2:%d", port, port)
+	a.log("抓包已开启: mitmdump :%d, 代理 %s:%d", port, proxyHost, port)
 	if targetPkg != "" {
 		_ = a.client.RestartApp(a.ctx, serial, targetPkg, "")
 		a.log("目标 APP %s 已重启", targetPkg)
@@ -267,8 +274,79 @@ func (a *App) StopCapture() error {
 		a.session = nil
 	}
 	a.capturing = false
+	a.paused = false
 	a.log("抓包已停止")
 	return nil
+}
+
+// PauseCapture 暂停记录: 写入暂停标记, addon 停止上报事件, 但流量仍经代理正常转发。
+// 与 StopCapture 的区别是不清代理、不杀 mitmdump, APP 网络行为完全不受影响。
+func (a *App) PauseCapture() error {
+	if !a.capturing {
+		return fmt.Errorf("抓包未在进行中")
+	}
+	if err := capture.SetPaused(true); err != nil {
+		a.log("暂停失败: %v", err)
+		return err
+	}
+	a.paused = true
+	a.log("已暂停记录: 流量继续转发, 不再新增请求行")
+	return nil
+}
+
+// ResumeCapture 恢复记录: 删除暂停标记, addon 继续上报后续请求。
+func (a *App) ResumeCapture() error {
+	if !a.capturing {
+		return fmt.Errorf("抓包未在进行中")
+	}
+	if err := capture.SetPaused(false); err != nil {
+		a.log("恢复失败: %v", err)
+		return err
+	}
+	a.paused = false
+	a.log("已恢复记录")
+	return nil
+}
+
+// CapturePaused 当前是否处于暂停记录状态。
+func (a *App) CapturePaused() bool { return a.paused }
+
+// ClearFlowBodies 清空落盘的完整响应体临时文件(前端清空请求列表时调用)。
+func (a *App) ClearFlowBodies() { capture.CleanFlowBodies() }
+
+// proxyHostFor 依据实例 serial 判定网络模式, 返回模拟器可访问的宿主机代理地址。
+//   - NAT(默认): serial = 127.0.0.1:port, 模拟器访问宿主机固定走 NAT 网关别名 10.0.2.2
+//   - 桥接: serial = <模拟器局域网IP>:5555, 取与模拟器同网段的本机网卡 IPv4
+func proxyHostFor(serial string) string {
+	host, _, err := net.SplitHostPort(serial)
+	if err != nil || host == "" || host == "127.0.0.1" || host == "localhost" {
+		return "10.0.2.2"
+	}
+	guest := net.ParseIP(host)
+	if guest == nil {
+		return "10.0.2.2"
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "10.0.2.2"
+	}
+	var fallback string
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok || ipnet.IP.To4() == nil || ipnet.IP.IsLoopback() {
+			continue
+		}
+		if fallback == "" {
+			fallback = ipnet.IP.String()
+		}
+		if ipnet.Contains(guest) {
+			return ipnet.IP.String()
+		}
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return "10.0.2.2"
 }
 
 // CaptureRunning 当前抓包状态。
@@ -276,6 +354,145 @@ func (a *App) CaptureRunning() bool { return a.capturing }
 
 // CAExists CA 是否已生成。
 func (a *App) CAExists() bool { return certstore.CAExists() }
+
+// CopyText 文本写入系统剪贴板。
+func (a *App) CopyText(text string) error {
+	if a.ctx == nil {
+		return fmt.Errorf("应用未就绪")
+	}
+	return runtime.ClipboardSetText(a.ctx, text)
+}
+
+// SaveResponseBody 将 addon 落盘的完整响应体另存到用户选择的位置。
+// srcPath 为事件中的 resp_body_file(仅接受本工具临时目录内的 <id>.body, 防误读任意路径)。
+func (a *App) SaveResponseBody(srcPath, suggestedName string) (string, error) {
+	if a.ctx == nil {
+		return "", fmt.Errorf("应用未就绪")
+	}
+	if srcPath == "" || !capture.IsFlowBodyPath(srcPath) {
+		return "", fmt.Errorf("该请求无完整响应体(pending/空 body/超过 256MB 未落盘)")
+	}
+	if _, err := os.Stat(srcPath); err != nil {
+		return "", fmt.Errorf("响应体临时文件已不存在: %v", err)
+	}
+	if suggestedName == "" {
+		suggestedName = "response"
+	}
+	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:                "另存响应体",
+		DefaultFilename:      suggestedName,
+		CanCreateDirectories: true,
+		Filters:              []runtime.FileFilter{{DisplayName: "所有文件", Pattern: "*.*"}},
+	})
+	if err != nil {
+		return "", err
+	}
+	if path == "" { // 用户取消
+		return "", nil
+	}
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	out, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+	n, err := io.Copy(out, in)
+	if err != nil {
+		return "", err
+	}
+	a.log("响应体已另存: %s (%s)", path, humanSize(n))
+	return path, nil
+}
+
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// HexDumpResult HEX 查看器分页结果。
+type HexDumpResult struct {
+	Text       string `json:"text"`        // hexdump 文本(xxd 风格, 每行末尾带回车)
+	NextOffset int64  `json:"next_offset"` // 下一段起始偏移
+	HasMore    bool   `json:"has_more"`    // 是否还有后续内容
+	Total      int64  `json:"total"`        // 文件总字节数
+}
+
+// HexDump 读取完整响应体临时文件, 生成 xxd/hexdump -C 风格文本。
+// 从 offset 起最多 maxBytes 字节(前端 64KB 分页加载)。
+func (a *App) HexDump(srcPath string, offset, maxBytes int) (HexDumpResult, error) {
+	if !capture.IsFlowBodyPath(srcPath) {
+		return HexDumpResult{}, fmt.Errorf("该请求无完整响应体文件")
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if maxBytes <= 0 || maxBytes > 1<<20 {
+		maxBytes = 1 << 20
+	}
+	st, err := os.Stat(srcPath)
+	if err != nil {
+		return HexDumpResult{}, fmt.Errorf("响应体临时文件已不存在: %v", err)
+	}
+	total := st.Size()
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return HexDumpResult{}, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(int64(offset), io.SeekStart); err != nil {
+		return HexDumpResult{}, err
+	}
+	buf := make([]byte, maxBytes)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return HexDumpResult{}, err
+	}
+	buf = buf[:n]
+	var b strings.Builder
+	for i := 0; i < n; i += 16 {
+		end := i + 16
+		if end > n {
+			end = n
+		}
+		fmt.Fprintf(&b, "%08x  ", offset+i)
+		for j := 0; j < 16; j++ {
+			if j == 8 {
+				b.WriteByte(' ')
+			}
+			if i+j < n {
+				fmt.Fprintf(&b, "%02x ", buf[i+j])
+			} else {
+				b.WriteString("   ")
+			}
+		}
+		b.WriteString(" |")
+		for j := i; j < end; j++ {
+			if c := buf[j]; c >= 0x20 && c < 0x7f {
+				b.WriteByte(c)
+			} else {
+				b.WriteByte('.')
+			}
+		}
+		b.WriteString("|\n")
+	}
+	next := int64(offset + n)
+	return HexDumpResult{
+		Text:       b.String(),
+		NextOffset: next,
+		HasMore:    next < total,
+		Total:      total,
+	}, nil
+}
 
 func configDir() string {
 	base, err := os.UserConfigDir()
